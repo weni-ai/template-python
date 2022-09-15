@@ -1,0 +1,223 @@
+version: '3.8'
+
+services:
+  ## Database
+  app-db:
+    image: postgres:13
+    deploy:
+      replicas: 1
+    environment:
+      POSTGRES_PORT: ${APP_DB_PORT}
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD}
+      POSTGRES_USER: ${APP_DB_USER}
+      POSTGRES_DB: ${APP_DB_NAME}
+    command: -p "${APP_DB_PORT}"
+    volumes:
+      - app_database:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - app-net
+
+  app-db-backup:
+    image: prodrigestivill/postgres-backup-local
+    restart: always
+    volumes:
+      - type: bind
+        source: ${APP_DB_BACKUP_OUT}
+        target: /backups
+    deploy:
+      mode: replicated
+      replicas: 1
+    environment:
+      POSTGRES_HOST: ${APP_DB_HOST}
+      POSTGRES_PORT: ${APP_DB_PORT}
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD}
+      POSTGRES_USER: ${APP_DB_USER}
+      POSTGRES_DB: ${APP_DB_NAME}
+      SCHEDULE: "@every 3h00m00s"
+      BACKUP_KEEP_DAYS: 7
+      BACKUP_KEEP_WEEKS: 4
+      BACKUP_KEEP_MONTHS: 12
+    networks:
+      - app-net
+
+  # Message Brocker
+  app-message-broker:
+    deploy:
+      replicas: 1
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${APP_RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${APP_RABBITMQ_DEFAULT_PASS}
+    networks:
+      - app-net
+
+  # HTTP Cache
+  app-cache:
+    image: nginx
+    environment:
+      APP_PORT: ${APP_PORT}
+      APP_HOST: ${APP_HOST}
+    volumes:
+      - app_http_cache:/var/cache/nginx
+    configs:
+      - source: nginx-cache.conf
+        target: /etc/nginx/nginx.conf
+    deploy:
+      replicas: 1
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.app-cache.rule=Host(`${APP_HOSTNAME_EXTERNAL}`)&&PathPrefix(`/www`)"
+        - "traefik.http.routers.app-cache.entrypoints=http"
+        - "traefik.http.services.app-cache.loadbalancer.server.port=80"
+    networks:
+      - app-net
+      - traefik-net
+
+  # Web worker
+  app-worker:
+    image: app-worker
+    environment:
+      APP_SQLALCHEMY_DATABASE_URI: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@${APP_DB_HOST}:${APP_DB_PORT}/${APP_DB_NAME}
+      APP_SOCKETIO_QUEUE: amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}
+      APP_CELERY_BROKER_URL: amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}
+      RABBITMQ_HOST: ${APP_RABBITMQ_HOST}
+      RABBITMQ_PORT: ${APP_RABBITMQ_PORT}
+      RABBITMQ_DEFAULT_USER: ${APP_RABBITMQ_PORT}
+      RABBITMQ_DEFAULT_PASS: ${APP_RABBITMQ_DEFAULT_PASS}
+      RABBITMQ_MANAGEMENT_PORT: ${APP_RABBITMQ_MANAGEMENT_PORT}
+      DB_HOST: ${APP_DB_HOST}
+      DB_PORT: ${APP_DB_PORT}
+    restart: unless-stopped
+    configs:
+      - env.sh
+    networks:
+      - app-net
+      - traefik-net
+    deploy:
+      replicas: 2
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.app-worker.rule=Host(`${APP_HOSTNAME_EXTERNAL}`)&&PathPrefix(`${APP_HTTP_PREFIX}`)"
+        - "traefik.http.routers.app-worker.entrypoints=http"
+        - "traefik.http.services.app-worker.loadbalancer.sticky=true"
+        - "traefik.http.services.app-worker.loadbalancer.server.port=${APP_PORT}"
+        - "traefik.http.services.app-worker.loadbalancer.sticky.cookie.name=StickyCookie"
+        - "traefik.http.routers.app-worker.middlewares=app-worker@docker"
+        - "traefik.http.middlewares.app-worker.stripprefix.prefixes=${APP_HTTP_PREFIX}"
+        - "traefik.http.middlewares.app-worker.stripprefix.forceslash=true"
+        - "traefik.http.services.app-worker.loadbalancer.healthcheck.path=/login"
+        - "traefik.http.services.app-worker.loadbalancer.healthcheck.scheme=http"
+#        - "traefik.http.services.app-worker.loadbalancer.sticky.cookie.secure=true"
+
+  # Celery
+
+  # Celery worker queue default
+  app-celery-worker:
+    image: app-worker
+    environment:
+      APP_SQLALCHEMY_DATABASE_URI: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@${APP_DB_HOST}:${APP_DB_PORT}/${APP_DB_NAME}
+      APP_SOCKETIO_QUEUE: amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}
+      APP_CELERY_BROKER_URL: amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}
+      RABBITMQ_HOST: ${APP_RABBITMQ_HOST}
+      RABBITMQ_PORT: ${APP_RABBITMQ_PORT}
+      RABBITMQ_DEFAULT_USER: ${APP_RABBITMQ_PORT}
+      RABBITMQ_DEFAULT_PASS: ${APP_RABBITMQ_DEFAULT_PASS}
+      RABBITMQ_MANAGEMENT_PORT: ${APP_RABBITMQ_MANAGEMENT_PORT}
+      DB_HOST: ${APP_DB_HOST}
+      DB_PORT: ${APP_DB_PORT}
+    restart: unless-stopped
+    configs:
+      - env.sh
+    networks:
+      - app-net
+      - ldap-net
+    healthcheck:
+      timeout: 20s
+      retries: 5
+      interval: 1m30s
+      test: ["CMD", "/app/utils/docker/docker-entrypoint.sh", "healthcheck-celery-worker"]
+    command: celery-worker
+    deploy:
+      replicas: 1
+
+  # Celery beat
+  app-celery-beat:
+    image: app-worker
+    environment:
+      APP_SQLALCHEMY_DATABASE_URI: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@${APP_DB_HOST}:${APP_DB_PORT}/${APP_DB_NAME}
+      APP_SOCKETIO_QUEUE: amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}
+      APP_CELERY_BROKER_URL: amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}
+      RABBITMQ_HOST: ${APP_RABBITMQ_HOST}
+      RABBITMQ_PORT: ${APP_RABBITMQ_PORT}
+      RABBITMQ_DEFAULT_USER: ${APP_RABBITMQ_PORT}
+      RABBITMQ_DEFAULT_PASS: ${APP_RABBITMQ_DEFAULT_PASS}
+      RABBITMQ_MANAGEMENT_PORT: ${APP_RABBITMQ_MANAGEMENT_PORT}
+      DB_HOST: ${APP_DB_HOST}
+      DB_PORT: ${APP_DB_PORT}
+    restart: unless-stopped
+    configs:
+      - env.sh
+    networks:
+      - app-net
+      - ldap-net
+    healthcheck:
+      timeout: 20s
+      retries: 5
+      interval: 1m30s
+      test: ["CMD", "/app/utils/docker/docker-entrypoint.sh", "healthcheck-celery-beat"]
+    command: celery-beat
+    deploy:
+      replicas: 1
+
+  # Celery Flower
+  app-celery-flower:
+    image: app-worker
+    environment:
+      APP_SQLALCHEMY_DATABASE_URI: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@${APP_DB_HOST}:${APP_DB_PORT}/${APP_DB_NAME}
+      APP_SOCKETIO_QUEUE: amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}
+      APP_CELERY_BROKER_URL: amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}
+      RABBITMQ_HOST: ${APP_RABBITMQ_HOST}
+      RABBITMQ_PORT: ${APP_RABBITMQ_PORT}
+      RABBITMQ_DEFAULT_USER: ${APP_RABBITMQ_PORT}
+      RABBITMQ_DEFAULT_PASS: ${APP_RABBITMQ_DEFAULT_PASS}
+      RABBITMQ_MANAGEMENT_PORT: ${APP_RABBITMQ_MANAGEMENT_PORT}
+      DB_HOST: ${APP_DB_HOST}
+      DB_PORT: ${APP_DB_PORT}
+
+      CELERY_FLOWER_PREFIX: ${APP_CELERY_FLOWER_PREFIX}
+      CELERY_FLOWER_PORT: ${APP_CELERY_FLOWER_PORT}
+      CELERY_FLOWER_USER: ${APP_CELERY_FLOWER_USER}
+      CELERY_FLOWER_PASSWORD: ${APP_CELERY_FLOWER_PASSWORD}
+    restart: unless-stopped
+    configs:
+      - env.sh
+    networks:
+      - app-net
+      - traefik-net
+    healthcheck:
+      test: ["CMD", "/app/utils/docker/docker-entrypoint.sh", "healthcheck-http-get", "127.0.0.1:${APP_CELERY_FLOWER_PORT}/${CELERY_FLOWER_PREFIX}"]
+    command: celery-flower
+    deploy:
+      replicas: 1
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.app-celery-flower.rule=PathPrefix(`${APP_CELERY_FLOWER_PREFIX}`)"
+        - "traefik.http.routers.app-celery-flower.entrypoints=http"
+        - "traefik.http.services.app-celery-flower.loadbalancer.server.port=${APP_CELERY_FLOWER_PORT}"
+
+configs:
+  env.sh:
+    file: .env
+  nginx-cache.conf:
+    file: utils/docker/nginx-cache.conf
+    template_driver: golang
+
+networks:
+  app-net:
+    external:
+      name: app-net
+  traefik-net:
+    external:
+      name: traefik-net
+
