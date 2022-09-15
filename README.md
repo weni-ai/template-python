@@ -18,5 +18,9 @@ Repositorio com codigo em python para servir de modelo e boas praticas no desenv
 [] `.dockerignore` excluindo arquivos principais(git e outras informações sensíveis)
 [] `.gitignore` com arquivos de editor e outros desnecessários
 [] Imagem pequena
-
+[] gunicorn com poucos processos de  workers
+[] gunicorn com max-requests habilitado
+[] gunicorn com logs de acesso
+[] gunicorn com erro para a saída padrão
+[] limites configurados
 
