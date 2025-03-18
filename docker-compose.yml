@@ -1,9 +1,9 @@
-version: '3.8'
+version: '3.9'
 
 services:
   ## Database
   app-db:
-    image: postgres:13
+    image: postgres:16
     deploy:
       replicas: 1
     environment:
@@ -54,12 +54,17 @@ services:
 
   # HTTP Cache
   app-cache:
-    image: nginx
+    image: nginxinc/nginx-unprivileged:1-alpine
+    readonly: true
+    cap_drop:
+      - ALL
+    user: "101:101"
     environment:
       APP_PORT: ${APP_PORT}
       APP_HOST: ${APP_HOST}
     volumes:
       - app_http_cache:/var/cache/nginx
+      - app_http_tmp:/tmp
     configs:
       - source: nginx-cache.conf
         target: /etc/nginx/nginx.conf
@@ -77,6 +82,16 @@ services:
   # Web worker
   app-worker:
     image: app-worker
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        APP_UID: "${APP_UID}"
+        APP_GID: "${APP_GID}"
+    readonly: true
+    cap_drop:
+      - ALL
+    user: "${APP_UID}:${APP_GID}"
     environment:
       APP_SQLALCHEMY_DATABASE_URI: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@${APP_DB_HOST}:${APP_DB_PORT}/${APP_DB_NAME}
       APP_SOCKETIO_QUEUE: amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}
@@ -94,6 +109,9 @@ services:
     networks:
       - app-net
       - traefik-net
+    # Test on localhost develop
+    #volumes:
+    #  - "${PWD}:/app"
     deploy:
       replicas: 2
       labels:
@@ -115,6 +133,16 @@ services:
   # Celery worker queue default
   app-celery-worker:
     image: app-worker
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        APP_UID: "${APP_UID}"
+        APP_GID: "${APP_GID}"
+    readonly: true
+    cap_drop:
+      - ALL
+    user: "${APP_UID}:${APP_GID}"
     environment:
       APP_SQLALCHEMY_DATABASE_URI: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@${APP_DB_HOST}:${APP_DB_PORT}/${APP_DB_NAME}
       APP_SOCKETIO_QUEUE: amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}
@@ -126,17 +154,20 @@ services:
       RABBITMQ_MANAGEMENT_PORT: ${APP_RABBITMQ_MANAGEMENT_PORT}
       DB_HOST: ${APP_DB_HOST}
       DB_PORT: ${APP_DB_PORT}
+    # Test on localhost develop
+    volumes:
+    #  - "${PWD}:/app"
+      - app_celery_tmp:/tmp
     restart: unless-stopped
     configs:
       - env.sh
     networks:
       - app-net
-      - ldap-net
     healthcheck:
       timeout: 20s
       retries: 5
       interval: 1m30s
-      test: ["CMD", "/app/utils/docker/docker-entrypoint.sh", "healthcheck-celery-worker"]
+      test: ["CMD", "/app/docker/docker-entrypoint.sh", "healthcheck-celery-worker"]
     command: celery-worker
     deploy:
       replicas: 1
@@ -144,6 +175,16 @@ services:
   # Celery beat
   app-celery-beat:
     image: app-worker
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        APP_UID: "${APP_UID}"
+        APP_GID: "${APP_GID}"
+    readonly: true
+    cap_drop:
+      - ALL
+    user: "${APP_UID}:${APP_GID}"
     environment:
       APP_SQLALCHEMY_DATABASE_URI: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@${APP_DB_HOST}:${APP_DB_PORT}/${APP_DB_NAME}
       APP_SOCKETIO_QUEUE: amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}
@@ -155,24 +196,31 @@ services:
       RABBITMQ_MANAGEMENT_PORT: ${APP_RABBITMQ_MANAGEMENT_PORT}
       DB_HOST: ${APP_DB_HOST}
       DB_PORT: ${APP_DB_PORT}
+    # Test on localhost develop
+    volumes:
+    #  - "${PWD}:/app"
+      - app_worker_tmp:/tmp
     restart: unless-stopped
     configs:
       - env.sh
     networks:
       - app-net
-      - ldap-net
     healthcheck:
       timeout: 20s
       retries: 5
       interval: 1m30s
-      test: ["CMD", "/app/utils/docker/docker-entrypoint.sh", "healthcheck-celery-beat"]
+      test: ["CMD", "/app/docker/docker-entrypoint.sh", "healthcheck-celery-beat"]
     command: celery-beat
     deploy:
       replicas: 1
 
   # Celery Flower
   app-celery-flower:
-    image: app-worker
+    image: mher/flower
+    readonly: true
+    cap_drop:
+      - ALL
+    user: "${APP_UID}:${APP_GID}"
     environment:
       APP_SQLALCHEMY_DATABASE_URI: postgresql://${APP_DB_USER}:${APP_DB_PASSWORD}@${APP_DB_HOST}:${APP_DB_PORT}/${APP_DB_NAME}
       APP_SOCKETIO_QUEUE: amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}
@@ -189,6 +237,10 @@ services:
       CELERY_FLOWER_PORT: ${APP_CELERY_FLOWER_PORT}
       CELERY_FLOWER_USER: ${APP_CELERY_FLOWER_USER}
       CELERY_FLOWER_PASSWORD: ${APP_CELERY_FLOWER_PASSWORD}
+    # Test on localhost develop
+    volumes:
+    #  - "${PWD}:/app"
+       - "app_flower_tmp:/tmp"
     restart: unless-stopped
     configs:
       - env.sh
@@ -196,8 +248,16 @@ services:
       - app-net
       - traefik-net
     healthcheck:
-      test: ["CMD", "/app/utils/docker/docker-entrypoint.sh", "healthcheck-http-get", "127.0.0.1:${APP_CELERY_FLOWER_PORT}/${CELERY_FLOWER_PREFIX}"]
-    command: celery-flower
+      test: ["CMD", "/app/docker/docker-entrypoint.sh", "healthcheck-http-get", "127.0.0.1:${APP_CELERY_FLOWER_PORT}/${CELERY_FLOWER_PREFIX}"]
+    command:
+      - celery
+      - -b
+      - "amqp://${APP_RABBITMQ_DEFAULT_USER}:${APP_RABBITMQ_DEFAULT_PASS}@${APP_RABBITMQ_HOST}"
+      - flower
+      - --port=${APP_CELERY_FLOWER_PORT}
+      - --address=0.0.0.0
+      - --xheaders
+      - --persistent
     deploy:
       replicas: 1
       labels:
@@ -210,7 +270,7 @@ configs:
   env.sh:
     file: .env
   nginx-cache.conf:
-    file: utils/docker/nginx-cache.conf
+    file: docker/nginx-cache.conf
     template_driver: golang
 
 networks:
